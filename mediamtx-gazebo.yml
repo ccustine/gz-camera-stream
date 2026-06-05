@@ -1,0 +1,80 @@
+# MediaMTX configuration for Gazebo camera streaming.
+#
+# Usage:
+#   mediamtx mediamtx-gazebo.yml
+#
+# This config enables demand-based streaming: when a browser navigates
+# to http://localhost:8889/<path>, MediaMTX sends a start command to
+# the Gazebo CameraStream plugin. When all viewers disconnect and the
+# timeout expires, it sends a stop command. The Gazebo encoder idles
+# when nobody is watching.
+#
+# The path pattern "gz~^(.+)$" matches any path prefixed with "gz"
+# (e.g., gz/camera, gz/cam2). The camera name is extracted from the
+# path via regex group G1.
+
+# Inherit all defaults from the system config
+logLevel: info
+
+# Control API (paths list, session management)
+api: yes
+apiAddress: :9997
+
+# RTSP
+rtsp: yes
+rtspAddress: :8554
+
+# WebRTC (includes WHIP ingest and WHEP playback)
+webrtc: yes
+webrtcAddress: :8889
+
+# Force IPv4 loopback for local-only use.
+# Without this, ICE sometimes picks IPv6 link-local addresses
+# which causes DTLS handshake failures between publisher and viewer.
+webrtcLocalUDPAddress: 127.0.0.1:8189
+webrtcIPsFromInterfaces: no
+webrtcAdditionalHosts:
+  - 127.0.0.1
+
+# HLS fallback
+hls: yes
+hlsAddress: :8888
+
+# Path configuration
+pathDefaults:
+  # No special defaults needed
+
+paths:
+  # Gazebo camera streams - demand-based lifecycle.
+  # Browser visits http://localhost:8889/cam1 ->
+  #   MediaMTX runs runOnDemand which tells Gazebo to start streaming.
+  # All browsers leave + 10s timeout ->
+  #   MediaMTX sends SIGINT to runOnDemand, then runs runOnUnDemand
+  #   which tells Gazebo to stop streaming.
+  #
+  # The path name IS the camera name, so requesting "cam1" streams
+  # the camera named "cam1" from Gazebo.
+  ~^(cam.+)$:
+    runOnDemand: >-
+      gz topic -t /stream/control -m gz.msgs.StringMsg_V
+      -p 'data: "start" data: "$G1" data: "http://localhost:8889/$G1/whip"'
+
+    runOnDemandRestart: no
+
+    # Wait up to 15s for Gazebo to start publishing (WHIP negotiation
+    # takes ~1-2s, but first render may take longer on cold start)
+    runOnDemandStartTimeout: 15s
+
+    # Keep streaming for 10s after the last viewer disconnects.
+    # This avoids stop/start churn if someone refreshes the page.
+    runOnDemandCloseAfter: 10s
+
+    # When the demand window closes, tell Gazebo to stop encoding.
+    runOnUnDemand: >-
+      gz topic -t /stream/control -m gz.msgs.StringMsg_V
+      -p 'data: "stop" data: "$G1"'
+
+  # Direct-control paths - for streams started explicitly via the
+  # viewer UI or gz topic CLI. No demand-based lifecycle.
+  # These stay alive until explicitly stopped.
+  all_others:

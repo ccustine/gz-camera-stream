@@ -1,0 +1,7 @@
+build/
+tmp/
+*.dylib
+*.so
+*.o
+.DS_Store
+.playwright-mcp/
