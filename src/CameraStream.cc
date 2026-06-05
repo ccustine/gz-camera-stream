@@ -20,6 +20,7 @@
 #include <gz/msgs/stringmsg_v.pb.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -109,6 +110,12 @@ class gz::sim::systems::CameraStreamPrivate
   /// \brief Default encoding fps
   public: unsigned int defaultFps = 30;
 
+  /// \brief Stream path prefix for namespacing (e.g., engineer name)
+  public: std::string streamPrefix;
+
+  /// \brief MediaMTX WHIP base URL (e.g., http://mediamtx:8889)
+  public: std::string mediamtxBase;
+
   /// \brief Current simulation time
   public: std::chrono::steady_clock::duration simTime{0};
 
@@ -135,12 +142,35 @@ void CameraStreamPrivate::OnControlMessage(const msgs::StringMsg_V &_msg)
 
   if (action == "start")
   {
-    if (_msg.data_size() < 3)
+    std::string url;
+
+    if (!this->mediamtxBase.empty())
     {
-      gzerr << "Stream start requires URL in data[2]" << std::endl;
+      // Construct RTSP URL from base + prefix + camera name.
+      // RTSP is used because the WHIP muxer requires FFmpeg 7+
+      // which isn't available in the Gazebo base image yet.
+      // MediaMTX auto-converts RTSP to WebRTC for browser playback.
+      std::string path = cameraName;
+      if (!path.empty() && path[0] == '/')
+        path = path.substr(1);
+      for (auto &c : path)
+        if (c == '/') c = '_';
+
+      url = this->mediamtxBase + "/";
+      if (!this->streamPrefix.empty())
+        url += this->streamPrefix + "/";
+      url += path;
+    }
+    else if (_msg.data_size() >= 3)
+    {
+      url = _msg.data(2);
+    }
+    else
+    {
+      gzerr << "Stream start requires URL in data[2] or "
+             << "MEDIAMTX_WHIP_BASE to be set" << std::endl;
       return;
     }
-    const std::string &url = _msg.data(2);
 
     unsigned int bitrate = this->defaultBitrate;
     unsigned int fps = this->defaultFps;
@@ -442,6 +472,28 @@ void CameraStream::Configure(
   this->dataPtr->defaultFps = _sdf->Get<unsigned int>(
       "default_fps", this->dataPtr->defaultFps).first;
 
+  if (_sdf->HasElement("stream_prefix"))
+  {
+    this->dataPtr->streamPrefix = _sdf->Get<std::string>("stream_prefix");
+  }
+  if (this->dataPtr->streamPrefix.empty())
+  {
+    const char *envPrefix = std::getenv("STREAM_PREFIX");
+    if (envPrefix)
+      this->dataPtr->streamPrefix = envPrefix;
+  }
+
+  if (_sdf->HasElement("mediamtx_base"))
+  {
+    this->dataPtr->mediamtxBase = _sdf->Get<std::string>("mediamtx_base");
+  }
+  if (this->dataPtr->mediamtxBase.empty())
+  {
+    const char *envBase = std::getenv("MEDIAMTX_WHIP_BASE");
+    if (envBase)
+      this->dataPtr->mediamtxBase = envBase;
+  }
+
   // Subscribe to control topic (for gz topic CLI and MediaMTX hooks)
   this->dataPtr->node.Subscribe(this->dataPtr->controlTopic,
       &CameraStreamPrivate::OnControlMessage, this->dataPtr.get());
@@ -455,6 +507,16 @@ void CameraStream::Configure(
          << std::endl;
   gzmsg << "Defaults: bitrate=" << this->dataPtr->defaultBitrate
          << " fps=" << this->dataPtr->defaultFps << std::endl;
+  if (!this->dataPtr->streamPrefix.empty())
+  {
+    gzmsg << "Stream prefix: [" << this->dataPtr->streamPrefix << "]"
+           << std::endl;
+  }
+  if (!this->dataPtr->mediamtxBase.empty())
+  {
+    gzmsg << "MediaMTX base: [" << this->dataPtr->mediamtxBase << "]"
+           << std::endl;
+  }
 }
 
 void CameraStream::PostUpdate(const UpdateInfo &_info,

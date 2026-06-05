@@ -136,6 +136,7 @@ bool StreamContext::InitFFmpeg()
 {
   // Detect output format from URL scheme
   const char *formatName = nullptr;
+  AVDictionary *opts = nullptr;
   if (this->url.find("http://") == 0 || this->url.find("https://") == 0)
   {
     // WHIP endpoint
@@ -155,7 +156,9 @@ bool StreamContext::InitFFmpeg()
   else if (this->url.find("rtsp://") == 0)
   {
     formatName = "rtsp";
-    gzmsg << "Using RTSP output for [" << this->url << "]" << std::endl;
+    // Force TCP transport for RTSP - more reliable in container networks
+    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    gzmsg << "Using RTSP/TCP output for [" << this->url << "]" << std::endl;
   }
   else
   {
@@ -274,7 +277,9 @@ bool StreamContext::InitFFmpeg()
   }
 
   // Write stream header
-  ret = avformat_write_header(this->fmtCtx, nullptr);
+  ret = avformat_write_header(this->fmtCtx, &opts);
+  if (opts)
+    av_dict_free(&opts);
   if (ret < 0)
   {
     char errbuf[256];
