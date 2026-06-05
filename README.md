@@ -1,100 +1,68 @@
 # gz-camera-stream
 
-A Gazebo Sim plugin that streams H.264 video from camera sensors to a [MediaMTX](https://github.com/bluenviron/mediamtx) server via WebRTC (WHIP). Viewers connect through a browser and receive low-latency WebRTC video without any additional software.
+A world-level system plugin for Gazebo Sim that streams H.264 video from camera sensors to a media server via WHIP or RTSP. Frames are captured in the `PostRender` callback, converted from RGB/RGBA to YUV420P, encoded with libx264 (ultrafast/zerolatency), and pushed to the configured endpoint. The plugin is idle by default and activates on demand through a gz-transport control topic.
 
-The plugin is idle by default and activates on demand - when a viewer requests a camera stream, the plugin starts encoding and pushing video. When all viewers disconnect, encoding stops. Multiple cameras can stream simultaneously, each on its own encoder thread.
-
-![Simulation Viewer](docs/viewer-screenshot.png)
-
-## How it works
+## Data flow
 
 ```
-Gazebo (render)  -->  CameraStream plugin (H.264)  --WHIP-->  MediaMTX  --WebRTC-->  Browser
+Gazebo (OGRE2 render) -> PostRender -> RGB->YUV420P (swscale) -> H.264 (libx264) -> WHIP or RTSP -> Media Server
 ```
 
-1. Gazebo renders camera frames using OGRE2
-2. The plugin copies each frame from the GPU, converts RGB to YUV420P, and encodes H.264 with libx264 (ultrafast/zerolatency)
-3. Encoded packets are pushed to MediaMTX over WHIP (WebRTC HTTP Ingest Protocol)
-4. MediaMTX serves the stream to browsers via WebRTC, with automatic conversion to HLS/RTSP/RTMP if needed
+## Output protocols
+
+The plugin auto-detects the output protocol from the URL scheme provided in the start command:
+
+| URL scheme | Protocol | FFmpeg muxer | Notes |
+|-----------|----------|-------------|-------|
+| `http://` / `https://` | WHIP | `whip` | WebRTC HTTP Ingest Protocol. Requires FFmpeg 7+ with the WHIP muxer compiled in. Lowest latency path to WebRTC viewers. |
+| `rtsp://` | RTSP | `rtsp` | Real Time Streaming Protocol. Available in all FFmpeg builds. Uses TCP transport in container environments for reliability. The receiving server (e.g., MediaMTX) can convert to WebRTC/HLS automatically. |
+
+If the WHIP muxer isn't available in the local FFmpeg build (common with distro packages prior to FFmpeg 7), the plugin logs a clear error and suggests using an `rtsp://` URL instead.
 
 ## Requirements
 
-- [Gazebo Sim](https://gazebosim.org/) (Rotary distribution / gz-sim 11)
-- [MediaMTX](https://github.com/bluenviron/mediamtx) v1.18+
-- FFmpeg 8.x with WHIP muxer and libx264 (Homebrew `ffmpeg` includes both - verify with `ffmpeg -muxers | grep whip`)
-- macOS (Apple Silicon) or Linux
+- [Gazebo Sim](https://gazebosim.org/) (Ionic or newer)
+- FFmpeg development libraries (`libavcodec`, `libavformat`, `libswscale`, `libavutil`) with libx264
+- cmake, pkg-config, C++17 compiler
 
-## Quick start
-
-### 1. Build the plugin
-
-**macOS (Homebrew):**
+## Build
 
 ```bash
-cd gz-camera-stream
+# macOS (Homebrew)
 cmake -B build -DCMAKE_PREFIX_PATH=/opt/homebrew
 cmake --build build
-cp build/libgz-sim-camera-stream-system.dylib /opt/homebrew/lib/
-```
 
-**Linux:**
-
-```bash
-cd gz-camera-stream
+# Linux
 cmake -B build
 cmake --build build
-sudo cp build/libgz-sim-camera-stream-system.so /usr/local/lib/
 ```
 
-### 2. Start MediaMTX
+The build produces `libgz-sim-camera-stream-system.dylib` (macOS) or `.so` (Linux). Point `GZ_SIM_SYSTEM_PLUGIN_PATH` at the directory containing the library.
 
-```bash
-mediamtx mediamtx-gazebo.yml
+## Plugin architecture
+
+```
+src/
+  CameraStream.hh/.cc     World plugin (ISystemConfigure + ISystemPostUpdate)
+  StreamContext.hh/.cc     Per-stream FFmpeg encoder + network output
+  FrameQueue.hh            Lock-free SPSC ring buffer (render thread -> encoder thread)
 ```
 
-### 3. Launch the simulation
+### CameraStream
 
-**macOS:**
+Implements `ISystemConfigure` and `ISystemPostUpdate`. On `Configure()`, it reads SDF parameters, subscribes to the control topic (both as a topic subscriber and a service for WebSocket access), and optionally reads `STREAM_PREFIX` and `MEDIAMTX_WHIP_BASE` from the environment. On `PostRender()`, it iterates active streams, lazy-initializes camera pointers by matching sensor names against the rendering scene, copies frames, and pushes them into each stream's ring buffer. Failed streams are reaped automatically after 30 consecutive write failures.
 
-```bash
-GZ_SIM_SYSTEM_PLUGIN_PATH=/opt/homebrew/lib \
-  gz sim -s -r --headless-rendering quadcopter_demo.sdf -v 4
-```
+### StreamContext
 
-**Linux:**
+Each `StreamContext` owns a dedicated encoder thread and the full FFmpeg pipeline: `AVCodecContext` (libx264, ultrafast/zerolatency), `SwsContext` (RGB/RGBA to YUV420P), and `AVFormatContext` (WHIP or RTSP output). The sws context is created lazily on the first frame to detect the actual pixel format (3-channel RGB vs 4-channel RGBA) from the rendering backend. WHIP connections retry up to 3 times with 2-second delays to handle DTLS port reuse after a prior session. RTSP connections use TCP transport by default for reliability in container networks.
 
-```bash
-GZ_SIM_SYSTEM_PLUGIN_PATH=/usr/local/lib \
-  gz sim -s -r --headless-rendering quadcopter_demo.sdf -v 4
-```
+### FrameQueue
 
-> **Note:** `quadcopter_demo.sdf` references the X3 UAV model from [Gazebo Fuel](https://fuel.gazebosim.org/). The first run will download it automatically - this requires a network connection and may take a moment.
-
-### 4. Open the viewer
-
-Serve `viewer.html` locally and open it in a browser:
-
-```bash
-python3 -m http.server 8080
-open http://localhost:8080/viewer.html
-```
-
-The viewer connects to Gazebo's WebSocket server on port **9002** and MediaMTX on port **8889**. Both must be reachable from the browser - if running on a remote host, update the addresses in `viewer.html`. The viewer auto-discovers available cameras and starts streaming the first one it finds.
-
-### 5. Fly the quadcopter (optional)
-
-```bash
-# Manual takeoff
-gz topic -t "/X3/gazebo/command/twist" -m gz.msgs.Twist \
-  -p "linear: {z: 0.5}"
-
-# Autonomous patrol
-./fly_patrol.sh
-```
+A 3-slot SPSC ring buffer. The render thread calls `TryPush()` which never blocks - if the encoder is behind, the oldest frame is overwritten (frame dropping over blocking). The encoder thread calls `WaitAndPop()` which blocks on a condition variable until a frame arrives or the timeout expires. Encoder threads sit at near-zero CPU when no frames are being produced.
 
 ## SDF configuration
 
-Add the plugin to any Gazebo world:
+Add the plugin to any world:
 
 ```xml
 <plugin filename="gz-sim-camera-stream-system"
@@ -102,86 +70,68 @@ Add the plugin to any Gazebo world:
   <topic>/stream/control</topic>
   <default_bitrate>4000000</default_bitrate>
   <default_fps>30</default_fps>
+  <stream_prefix>my_robot</stream_prefix>
+  <mediamtx_base>rtsp://mediamtx:8554</mediamtx_base>
 </plugin>
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `topic` | `/stream/control` | gz-transport topic and service for stream control |
+| `topic` | `/stream/control` | gz-transport topic and service for start/stop commands |
 | `default_bitrate` | `4000000` | H.264 encoding bitrate in bps |
 | `default_fps` | `30` | Encoding framerate |
+| `stream_prefix` | *(none)* | Path prefix prepended to all output URLs (e.g., `my_robot` produces `rtsp://host/my_robot/cam1`). Also reads from `STREAM_PREFIX` env var. |
+| `mediamtx_base` | *(none)* | Base URL for the media server. When set, the plugin constructs output URLs internally from `<base>/<prefix>/<camera>` instead of requiring the URL in the start command. Also reads from `MEDIAMTX_WHIP_BASE` env var. |
 
 ## Stream control
 
 Start and stop streams by publishing `gz.msgs.StringMsg_V` to the control topic:
 
 ```bash
-# Start streaming a camera to MediaMTX
+# Start via WHIP (requires FFmpeg 7+ with WHIP muxer)
 gz topic -t /stream/control -m gz.msgs.StringMsg_V \
-  -p 'data: "start" data: "camera_name" data: "http://localhost:8889/stream_path/whip"'
+  -p 'data: "start" data: "cam1" data: "http://localhost:8889/cam1/whip"'
+
+# Start via RTSP
+gz topic -t /stream/control -m gz.msgs.StringMsg_V \
+  -p 'data: "start" data: "cam1" data: "rtsp://localhost:8554/cam1"'
+
+# Start with custom bitrate and fps
+gz topic -t /stream/control -m gz.msgs.StringMsg_V \
+  -p 'data: "start" data: "cam1" data: "rtsp://localhost:8554/cam1" data: "2000000" data: "15"'
 
 # Stop
 gz topic -t /stream/control -m gz.msgs.StringMsg_V \
-  -p 'data: "stop" data: "camera_name"'
+  -p 'data: "stop" data: "cam1"'
 ```
 
-The viewer handles this automatically through the sidebar UI.
+### Message format
 
-## Camera naming and MediaMTX path matching
+**Start:** `data=["start", "<camera_name>", "<url>", "<bitrate>", "<fps>"]`
 
-The included `mediamtx-gazebo.yml` matches paths using the regex `~^(cam.+)$`, which covers names like `camera`, `cam1`, `cam_front`, and `cam_down`. Camera names that do not start with `cam` (e.g., `front`, `overhead`, `drone`) will not be picked up by this pattern - MediaMTX will accept the viewer connection but will never trigger the demand hook, so no stream starts.
+- `camera_name` - sensor name to match. Can be a short name (`cam1`), a topic-style path (`X3/front_camera`), or a fully scoped rendering name (`sensor_pod::pod_link::front_camera`).
+- `url` - WHIP (`http://...`) or RTSP (`rtsp://...`) endpoint. Optional when `mediamtx_base` is configured.
+- `bitrate` / `fps` - optional per-stream overrides.
 
-To support other naming schemes, edit the path key in `mediamtx-gazebo.yml`:
+**Stop:** `data=["stop", "<camera_name>"]`
 
-```yaml
-# Match any camera name
-~^(.+)$:
-  runOnDemand: ...
+## Camera name matching
 
-# Or match specific names
-front_camera:
-  runOnDemand: ...
-overhead:
-  runOnDemand: ...
-```
+The plugin resolves camera names against the rendering scene in order:
 
-If you use a catch-all pattern (`~^(.+)$`), be aware it will trigger for any path a viewer requests, including typos.
+1. Exact match via `Scene::SensorByName()`
+2. Short name extraction (last segment after `/`) and exact match
+3. Suffix match - scan all sensors for one ending with `::<short_name>`
 
-## Project structure
+This lets you refer to cameras by whatever name is convenient. A request for `front_camera` will match `sensor_pod::pod_link::front_camera` in the scene. Matches are logged at `msg` level.
 
-```
-gz-camera-stream/
-  CMakeLists.txt            Standalone CMake build
-  viewer.html               Web UI (topic tree, camera selector, WebRTC player)
-  mediamtx-gazebo.yml       MediaMTX config (IPv4 loopback, demand-based paths)
-  quadcopter_demo.sdf       Demo world: X3 UAV, 3 cameras, ground objects
-  headless_camera.sdf       Minimal test world: spinning arm, static camera
-  fly_patrol.sh             Autonomous flight script for the X3 UAV
-  src/
-    CameraStream.hh/.cc     World-level system plugin (control topic, PostRender)
-    StreamContext.hh/.cc     Per-stream FFmpeg encoder + WHIP output
-    FrameQueue.hh            Lock-free SPSC ring buffer (render thread -> encoder)
-  docs/
-    viewer-screenshot.png    UI screenshot
-```
+## Design decisions
 
-## Architecture
-
-- **One encoder thread per stream** - no stream waits for another's encode. Threads sleep on a condition variable between frames (near-zero CPU when idle).
-- **Frame dropping over blocking** - if the encoder falls behind, the oldest frame in the 3-frame ring buffer is overwritten rather than stalling the render thread.
-- **WHIP with RTSP fallback** - auto-detects FFmpeg WHIP muxer availability. Pass an `rtsp://` URL to use RTSP instead.
-- **Write-failure auto-stop** - if MediaMTX goes away, the plugin detects consecutive write failures and stops the stream automatically.
-- **Sensor name matching** - cameras can be requested by short name (e.g., `camera`) and the plugin resolves it against the full scoped sensor name in the rendering scene (e.g., `tower_camera::link::tower_camera`).
-
-## Included demo worlds
-
-### `quadcopter_demo.sdf`
-
-X3 UAV quadcopter from [Gazebo Fuel](https://fuel.gazebosim.org/) with velocity control, three cameras (front-facing 1280x720, downward 640x480, tower overview 1280x720), ground objects (gas station, vehicles, warehouse, water tower), and a landing pad. Controllable via Twist commands.
-
-### `headless_camera.sdf`
-
-Minimal test scene with a spinning arm, falling shapes, and a single static camera. Useful for verifying the streaming pipeline works.
+- **One encoder thread per stream** - no stream waits on another's encode cycle. Threads sleep on a condition variable between frames.
+- **Frame dropping over blocking** - the 3-frame ring buffer overwrites the oldest frame if the encoder falls behind, rather than stalling the render thread.
+- **WHIP with RTSP fallback** - WHIP gives the lowest-latency path to WebRTC but requires a newer FFmpeg. RTSP works everywhere and most media servers (MediaMTX, Wowza, etc.) convert it to WebRTC on the fly.
+- **Write-failure auto-stop** - 30 consecutive write failures trigger automatic stream teardown. Handles the media server going away without leaking encoder threads.
+- **Lazy sws context** - pixel format detection is deferred to the first frame so the plugin adapts to whatever the rendering backend produces (RGB or RGBA) without configuration.
 
 ## License
 
